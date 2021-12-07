@@ -335,10 +335,29 @@ struct LiftedValue
 end
 const LiftedLeaves = IdDict{Any, Union{Nothing,LiftedValue}}
 
+# NOTE we use `IdSet{Int}` instead of `BitSet` for in these passes since they work on IR after inlining,
+# which can be very large sometimes, and program counters in question are often very sparse
+const SPCSet = IdSet{Int}
+
+mutable struct NestedLoads
+    maybe::Union{Nothing,SPCSet}
+    NestedLoads() = new(nothing)
+end
+function record_nested_load!(nested_loads::NestedLoads, pc::Int)
+    maybe = nested_loads.maybe
+    maybe === nothing && (maybe = nested_loads.maybe = SPCSet())
+    push!(maybe::SPCSet, pc)
+end
+function is_nested_load(nested_loads::NestedLoads, pc::Int)
+    maybe = nested_loads.maybe
+    maybe === nothing && return false
+    return pc in maybe::SPCSet
+end
+
 # try to compute lifted values that can replace `getfield(x, field)` call
 # where `x` is an immutable struct that are defined at any of `leaves`
-function lift_leaves(compact::IncrementalCompact,
-                     @nospecialize(result_t), field::Int, leaves::Vector{Any})
+function lift_leaves!(compact::IncrementalCompact, leaves::Vector{Any},
+                      @nospecialize(result_t), field::Int, nested_loads::NestedLoads)
     # For every leaf, the lifted value
     lifted_leaves = LiftedLeaves()
     maybe_undef = false
@@ -388,9 +407,17 @@ function lift_leaves(compact::IncrementalCompact,
                     ocleaf = simple_walk(compact, ocleaf)
                 end
                 ocdef, _ = walk_to_def(compact, ocleaf)
-                if isexpr(ocdef, :new_opaque_closure) && isa(field, Int) && 1 ≤ field ≤ length(ocdef.args)-5
+                if isexpr(ocdef, :new_opaque_closure) && 1 ≤ field ≤ length(ocdef.args)-5
                     lift_arg!(compact, leaf, cache_key, ocdef, 5+field, lifted_leaves)
                     continue
+                end
+                return nothing
+            elseif isa(def, Expr) && is_known_call(def, getfield, compact)
+                if isa(leaf, SSAValue)
+                    struct_typ = unwrap_unionall(widenconst(argextype(def.args[2], compact)))
+                    if ismutabletype(struct_typ)
+                        record_nested_load!(nested_loads, leaf.id)
+                    end
                 end
                 return nothing
             else
@@ -617,10 +644,6 @@ function perform_lifting!(compact::IncrementalCompact,
     return stmt_val # N.B. should never happen
 end
 
-# NOTE we use `IdSet{Int}` instead of `BitSet` for in these passes since they work on IR after inlining,
-# which can be very large sometimes, and program counters in question are often very sparse
-const SPCSet = IdSet{Int}
-
 """
     sroa_pass!(ir::IRCode) -> newir::IRCode
 
@@ -639,10 +662,11 @@ its argument).
 In a case when all usages are fully eliminated, `struct` allocation may also be erased as
 a result of succeeding dead code elimination.
 """
-function sroa_pass!(ir::IRCode)
+function sroa_pass!(ir::IRCode, optional_opts::Bool = true)
     compact = IncrementalCompact(ir)
     defuses = nothing # will be initialized once we encounter mutability in order to reduce dynamic allocations
     lifting_cache = IdDict{Pair{AnySSAValue, Any}, AnySSAValue}()
+    nested_loads = NestedLoads() # tracks nested `getfield(getfield(...)::Mutable, ...)::Immutable`
     for ((_, idx), stmt) in compact
         # check whether this statement is `getfield` / `setfield!` (or other "interesting" statement)
         isa(stmt, Expr) || continue
@@ -698,7 +722,9 @@ function sroa_pass!(ir::IRCode)
                     if defuses === nothing
                         defuses = IdDict{Int, Tuple{SPCSet, SSADefUse}}()
                     end
-                    mid, defuse = get!(defuses, defidx, (SPCSet(), SSADefUse()))
+                    mid, defuse = get!(defuses, defidx) do
+                        SPCSet(), SSADefUse()
+                    end
                     push!(defuse.ccall_preserve_uses, idx)
                     union!(mid, intermediaries)
                 end
@@ -708,16 +734,17 @@ function sroa_pass!(ir::IRCode)
                 compact[idx] = form_new_preserves(stmt, preserved, new_preserves)
             end
             continue
-        # TODO: This isn't the best place to put these
-        elseif is_known_call(stmt, typeassert, compact)
-            canonicalize_typeassert!(compact, idx, stmt)
-            continue
-        elseif is_known_call(stmt, (===), compact)
-            lift_comparison!(compact, idx, stmt, lifting_cache)
-            continue
-        # elseif is_known_call(stmt, isa, compact)
-            # TODO do a similar optimization as `lift_comparison!` for `===`
         else
+            if optional_opts
+                # TODO: This isn't the best place to put these
+                if is_known_call(stmt, typeassert, compact)
+                    canonicalize_typeassert!(compact, idx, stmt)
+                elseif is_known_call(stmt, (===), compact)
+                    lift_comparison!(compact, idx, stmt, lifting_cache)
+                # elseif is_known_call(stmt, isa, compact)
+                    # TODO do a similar optimization as `lift_comparison!` for `===`
+                end
+            end
             continue
         end
 
@@ -753,7 +780,9 @@ function sroa_pass!(ir::IRCode)
                 if defuses === nothing
                     defuses = IdDict{Int, Tuple{SPCSet, SSADefUse}}()
                 end
-                mid, defuse = get!(defuses, def.id, (SPCSet(), SSADefUse()))
+                mid, defuse = get!(defuses, def.id) do
+                    SPCSet(), SSADefUse()
+                end
                 if is_setfield
                     push!(defuse.defs, idx)
                 else
@@ -775,7 +804,7 @@ function sroa_pass!(ir::IRCode)
         isempty(leaves) && continue
 
         result_t = argextype(SSAValue(idx), compact)
-        lifted_result = lift_leaves(compact, result_t, field, leaves)
+        lifted_result = lift_leaves!(compact, leaves, result_t, field, nested_loads)
         lifted_result === nothing && continue
         lifted_leaves, any_undef = lifted_result
 
@@ -811,20 +840,23 @@ function sroa_pass!(ir::IRCode)
         used_ssas = copy(compact.used_ssas)
         simple_dce!(compact, (x::SSAValue) -> used_ssas[x.id] -= 1)
         ir = complete(compact)
-        sroa_mutables!(ir, defuses, used_ssas)
-        return ir
+        return sroa_mutables!(ir, defuses, used_ssas, nested_loads)
     else
         simple_dce!(compact)
         return complete(compact)
     end
 end
 
-function sroa_mutables!(ir::IRCode, defuses::IdDict{Int, Tuple{SPCSet, SSADefUse}}, used_ssas::Vector{Int})
+function sroa_mutables!(ir::IRCode,
+    defuses::IdDict{Int, Tuple{SPCSet, SSADefUse}}, used_ssas::Vector{Int},
+    nested_loads::NestedLoads)
     # Compute domtree, needed below, now that we have finished compacting the IR.
     # This needs to be after we iterate through the IR with `IncrementalCompact`
     # because removing dead blocks can invalidate the domtree.
     @timeit "domtree 2" domtree = construct_domtree(ir.cfg.blocks)
 
+    nested_mloads = NestedLoads() # tracks nested `getfield(getfield(...)::Mutable, ...)::Mutable`
+    local any_eliminated = any_meliminated = false
     for (idx, (intermediaries, defuse)) in defuses
         intermediaries = collect(intermediaries)
         # Check if there are any uses we did not account for. If so, the variable
@@ -840,7 +872,19 @@ function sroa_mutables!(ir::IRCode, defuses::IdDict{Int, Tuple{SPCSet, SSADefUse
         nleaves == nuses_total || continue
         # Find the type for this allocation
         defexpr = ir[SSAValue(idx)]
-        isexpr(defexpr, :new) || continue
+        isa(defexpr, Expr) || continue
+        if !isexpr(defexpr, :new)
+            if is_known_call(defexpr, getfield, ir)
+                val = defexpr.args[2]
+                if isa(val, SSAValue)
+                    struct_typ = unwrap_unionall(widenconst(argextype(val, ir)))
+                    if ismutabletype(struct_typ)
+                        record_nested_load!(nested_mloads, idx)
+                    end
+                end
+            end
+            continue
+        end
         newidx = idx
         typ = ir.stmts[newidx][:type]
         if isa(typ, UnionAll)
@@ -909,6 +953,12 @@ function sroa_mutables!(ir::IRCode, defuses::IdDict{Int, Tuple{SPCSet, SSADefUse
                 # Now go through all uses and rewrite them
                 for stmt in du.uses
                     ir[SSAValue(stmt)] = compute_value_for_use(ir, domtree, allblocks, du, phinodes, fidx, stmt)
+                    if !any_eliminated
+                        any_eliminated |= is_nested_load(nested_loads, stmt)
+                    end
+                    if !any_meliminated
+                        any_meliminated |= is_nested_load(nested_mloads, stmt)
+                    end
                 end
                 if !isbitstype(ftyp)
                     if preserve_uses !== nothing
@@ -944,6 +994,11 @@ function sroa_mutables!(ir::IRCode, defuses::IdDict{Int, Tuple{SPCSet, SSADefUse
         end
 
         @label skip
+    end
+    if any_eliminated || any_meliminated
+        return sroa_pass!(compact!(ir), false)
+    else
+        return ir
     end
 end
 
