@@ -90,8 +90,8 @@ Standard library changes
 #### Package Manager
 
 #### LinearAlgebra
-* The BLAS submodule now supports the level-2 BLAS subroutine `spr!` ([#42830]).
 
+* The BLAS submodule now supports the level-2 BLAS subroutine `spr!` ([#42830]).
 * The standard library `LinearAlgebra.jl` is now completely independent of `SparseArrays.jl`,
   both in terms of the source code as well as unit testing ([#43127]). As a consequence,
   sparse arrays are no longer (silently) returned by methods from `LinearAlgebra` applied
@@ -105,6 +105,9 @@ Standard library changes
     As a consequence, products of bi-, tri- and symmetric tridiagonal matrices with each
     other result in dense output. Moreover, constructing 3-arg similar matrices of special
     "sparse" matrices of (nonstatic) matrices now fails for the lack of `zero(::Type{Matrix{T}})`.
+* `cholesky[!]` now supports `LinearAlgebra.PivotingStrategy` (singleton type) values
+  as its optional `pivot` argument: the default is `cholesky(A, NoPivot())` (vs.
+  `cholesky(A, RowMaximum())`); the former `Val{true/false}`-based calls are deprecated. ([#41640])
 
 #### Markdown
 
